@@ -1,4 +1,4 @@
-# vme-netconfig v2.9.0
+# vme-netconfig v2.11.0
 
 Network configurator, auditor, and repair tool for **HPE Morpheus VM Essentials /
 HVM 9.0.1+** hosts on Ubuntu 22.04 / 24.04.
@@ -132,6 +132,15 @@ ens3f1                   iSCSI path B   192.168.202.x/24
 
 ### `converged` — 4 NICs
 
+HPE's documented answer for four-NIC hosts, not a workaround. Two NICs (one per
+card) bond into a trunk carrying the management VLAN *and* the compute VLANs;
+the other two do storage MPIO, one per storage VLAN.
+
+`--reconfigure` offers it automatically when no NICs remain after the management
+bond, and refuses to build it with an untagged management VLAN — the untagged
+bond becomes the `cmpt` port, and an OVS port belongs to one bridge only.
+
+
 ```
 bond0        ens1f0 + ens1f1   carries both
 bond0.<vlan>                   management L3 (HPE's example uses bond0.2)
@@ -263,7 +272,7 @@ re-running host prep.
 
 ## Compute VLANs are not netplan's business
 
-Tagged VM networks are created in **VME Manager** as HVM
+Tagged VM networks (200, 210, 211, …) are created in **VME Manager** as HVM
 Standard Networks — OVS port groups on the `cmpt` bridge. The compute uplink is
 handed to VME as a bare untagged trunk.
 

@@ -31,7 +31,7 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-VERSION="2.9.0"
+VERSION="2.12.0"
 PROG="${0##*/}"
 
 # ---------------------------------------------------------------------------
@@ -317,9 +317,10 @@ discover_nics() {
       local peer port
       peer="$(lldpctl -f keyvalue "$n" 2>/dev/null | awk -F= '/\.chassis\.name=/{print $2; exit}')"
       port="$(lldpctl -f keyvalue "$n" 2>/dev/null | awk -F= '/\.port\.descr=/{print $2; exit}')"
-      [[ -n "${peer:-}" ]] && NIC_LLDP[$n]="${peer}${port:+ / $port}"
+      if [[ -n "${peer:-}" ]]; then NIC_LLDP[$n]="${peer}${port:+ / $port}"; fi
     fi
   done
+  return 0
 }
 
 print_nic_table() {
@@ -1664,6 +1665,7 @@ reconfigure() {
   note "Storage interfaces are protected. Only the NICs you nominate for management"
   note "and compute are rewritten, plus the two VME bridge files."
 
+  VME_TOPOLOGY="decoupled"
   rc_cluster_guard
   discover_nics
   rc_classify_nics
@@ -1734,34 +1736,84 @@ reconfigure() {
 
   # --- compute ---------------------------------------------------------
   hdr "Compute uplink (cmpt)"
-  COMPUTE_BOND="$(ask 'Compute bond name' 'bond1')"
-  while true; do
-    sel="$(ask 'NIC number(s) for the compute bond')"
-    COMPUTE_MEMBERS="$(rc_nic_by_index "$sel" || true)"
-    [[ "$COMPUTE_MEMBERS" != "__BAD__" && -n "$COMPUTE_MEMBERS" ]] && break
-    warn "invalid selection"
+  local remaining=0 c
+  for c in "${RC_CANDIDATES[@]}"; do
+    local used="no" y
+    for y in $MGMT_MEMBERS; do [[ "$c" == "$y" ]] && used="yes"; done
+    [[ "$used" == "no" ]] && remaining=$((remaining+1))
   done
-  local x y
-  for x in $COMPUTE_MEMBERS; do
-    for y in $MGMT_MEMBERS; do [[ "$x" == "$y" ]] && die "NIC ${x} cannot serve both bonds"; done
-  done
-  COMPUTE_LINK_MODE="bond"
-  while true; do
-    COMPUTE_MTU="$(ask 'Compute MTU (9000 gives VXLAN overlay headroom)' '9000')"
-    valid_mtu "$COMPUTE_MTU" && break
-  done
-  [[ "$COMPUTE_MTU" -lt 1550 ]] && warn "MTU < 1550 breaks 1500-byte guests over VXLAN overlay"
+
+  if [[ "$remaining" -eq 0 ]]; then
+    warn "No NICs left after the management bond."
+    note "HPE's four-NIC reference design converges management and compute onto the"
+    note "same trunk: the bond carries the management VLAN plus the compute VLANs,"
+    note "with the remaining two NICs doing storage MPIO. That is what this host is"
+    note "cabled for, so converging is the documented answer rather than a compromise."
+    [[ "$(ask_yn 'Converge compute onto the management bond?' 'y')" == "y" ]] \
+      || die "no NICs available for a separate compute bond"
+    VME_TOPOLOGY="converged"
+  else
+    if [[ "$(ask_yn 'Converge compute onto the management bond (4-NIC design)?' 'n')" == "y" ]]; then
+      VME_TOPOLOGY="converged"
+    fi
+  fi
+
+  if [[ "$VME_TOPOLOGY" == "converged" ]]; then
+    if [[ "$MGMT_VLAN" == "0" ]]; then
+      bad "Converged requires a TAGGED management VLAN."
+      note "     The untagged bond becomes the cmpt trunk. An OVS port belongs to one"
+      note "     bridge, so management cannot also sit on the untagged bond - it has"
+      note "     to ride a VLAN subinterface."
+      while true; do
+        MGMT_VLAN="$(ask 'Management VLAN id')"
+        valid_vlan "$MGMT_VLAN" && [[ "$MGMT_VLAN" != "0" ]] && break
+        warn "vlan must be 1-4094"
+      done
+      warn "The switch ports for ${MGMT_MEMBERS} must tag VLAN ${MGMT_VLAN}."
+    fi
+    COMPUTE_BOND="$MGMT_BOND"
+    COMPUTE_MEMBERS="$MGMT_MEMBERS"
+    COMPUTE_MTU="$MGMT_MTU"
+    COMPUTE_LINK_MODE="$MGMT_LINK_MODE"
+    ok "converged: ${MGMT_BOND} carries mgmt (VLAN ${MGMT_VLAN}) and the compute trunk"
+    note "mgmt bridge  <- ${MGMT_BOND}.${MGMT_VLAN}"
+    note "cmpt bridge  <- ${MGMT_BOND} (untagged)"
+    warn "How VME plumbs these two bridges onto one bond is its business, not ours."
+    warn "Let host prep build cmpt from the cluster wizard rather than hand-building."
+  else
+    COMPUTE_BOND="$(ask 'Compute bond name' 'bond1')"
+    while true; do
+      sel="$(ask 'NIC number(s) for the compute bond')"
+      COMPUTE_MEMBERS="$(rc_nic_by_index "$sel" || true)"
+      [[ "$COMPUTE_MEMBERS" != "__BAD__" && -n "$COMPUTE_MEMBERS" ]] && break
+      warn "invalid selection"
+    done
+    local x y
+    for x in $COMPUTE_MEMBERS; do
+      for y in $MGMT_MEMBERS; do [[ "$x" == "$y" ]] && die "NIC ${x} cannot serve both bonds"; done
+    done
+    COMPUTE_LINK_MODE="bond"
+    while true; do
+      COMPUTE_MTU="$(ask 'Compute MTU (9000 gives VXLAN overlay headroom)' '9000')"
+      valid_mtu "$COMPUTE_MTU" && break
+    done
+    [[ "$COMPUTE_MTU" -lt 1550 ]] && warn "MTU < 1550 breaks 1500-byte guests over VXLAN overlay"
+    ok "${COMPUTE_BOND} <- ${COMPUTE_MEMBERS} @ MTU ${COMPUTE_MTU}"
+    warn "The switch ports for ${COMPUTE_MEMBERS} must trunk those VLANs."
+  fi
   COMPUTE_VLANS="$(ask 'Compute VLAN ids/range (recorded for the cluster wizard)' '')"
-  ok "${COMPUTE_BOND} <- ${COMPUTE_MEMBERS} @ MTU ${COMPUTE_MTU}"
-  warn "The switch ports for ${COMPUTE_MEMBERS} must trunk those VLANs."
 
   # --- review ----------------------------------------------------------
   hdr "Review"
-  VME_TOPOLOGY="decoupled"; COMPUTE2_MEMBERS=""
+  COMPUTE2_MEMBERS=""
   printf '   %-24s %s\n' "base file:"    "${base_file}"
   printf '   %-24s %s <- %s (mtu %s, %s)\n' "management bond:" "$MGMT_BOND" "$MGMT_MEMBERS" "$MGMT_MTU" "$BOND_MODE"
   printf '   %-24s %s\n' "mgmt bridge enslaves:" "$(mgmt_l3dev)"
-  printf '   %-24s %s <- %s (mtu %s, %s)\n' "compute bond:" "$COMPUTE_BOND" "$COMPUTE_MEMBERS" "$COMPUTE_MTU" "$BOND_MODE"
+  if [[ "$VME_TOPOLOGY" == "converged" ]]; then
+    printf '   %-24s %s (converged - same bond as management)\n' "compute bond:" "$COMPUTE_BOND"
+  else
+    printf '   %-24s %s <- %s (mtu %s, %s)\n' "compute bond:" "$COMPUTE_BOND" "$COMPUTE_MEMBERS" "$COMPUTE_MTU" "$BOND_MODE"
+  fi
   printf '   %-24s %s\n' "cmpt bridge enslaves:" "$COMPUTE_BOND"
   printf '   %-24s %s\n' "untouched (storage):" "${RC_PROTECTED:-none}"
   printf '\n'
@@ -1905,6 +1957,9 @@ vlans = net.setdefault("vlans", {})
 
 owned = set(c["mgmt_members"]) | set(c["cmpt_members"])
 mgmt_l3dev = "%s.%d" % (c["mgmt_bond"], c["mgmt_vlan"]) if c["mgmt_vlan"] else c["mgmt_bond"]
+if c["cmpt_bond"] == c["mgmt_bond"] and not c["mgmt_vlan"]:
+    sys.exit("converged requires a tagged management VLAN: %s cannot be a port on "
+             "both the mgmt and cmpt bridges" % c["mgmt_bond"])
 
 changes = []
 
@@ -1936,12 +1991,15 @@ for bname, bcfg in list(bonds.items()):
             for vn in [v for v in vlans if (vlans[v] or {}).get("link") == bname]:
                 del vlans[vn]; changes.append("%s: removed (parent gone)" % vn)
 
+converged = c["cmpt_bond"] == c["mgmt_bond"]
 bonds[c["mgmt_bond"]] = {"interfaces": c["mgmt_members"], "mtu": c["mgmt_mtu"],
                          "dhcp4": False, "parameters": params(c["bond_mode"])}
-bonds[c["cmpt_bond"]] = {"interfaces": c["cmpt_members"], "mtu": c["cmpt_mtu"],
-                         "dhcp4": False, "parameters": params(c["bond_mode"])}
-changes.append("%s: %s" % (c["mgmt_bond"], c["mgmt_members"]))
-changes.append("%s: %s" % (c["cmpt_bond"], c["cmpt_members"]))
+changes.append("%s: %s%s" % (c["mgmt_bond"], c["mgmt_members"],
+                             " (converged mgmt+compute)" if converged else ""))
+if not converged:
+    bonds[c["cmpt_bond"]] = {"interfaces": c["cmpt_members"], "mtu": c["cmpt_mtu"],
+                             "dhcp4": False, "parameters": params(c["bond_mode"])}
+    changes.append("%s: %s" % (c["cmpt_bond"], c["cmpt_members"]))
 
 # drop stale VLANs on our bonds, then create the mgmt one (bare - bridge owns L3)
 for vn in [v for v in list(vlans) if (vlans[v] or {}).get("link") in (c["mgmt_bond"], c["cmpt_bond"])]:
@@ -2082,6 +2140,8 @@ doctor() {
     check_bond_health_doctor "$b"
   done
 
+  doctor_switch_side
+
   # --- 2. addressing / routing -------------------------------------------
   hdr "addressing and routing"
   local defcount; defcount="$(ip -4 route show default 2>/dev/null | wc -l)"
@@ -2101,6 +2161,14 @@ doctor() {
   if [[ -r "$PROFILE_FILE" ]]; then
     ( set +u; . "$PROFILE_FILE" ) >/dev/null 2>&1 || true
     mgmt_expected="$(mgmt_l3dev 2>/dev/null || true)"
+  fi
+  # No profile on a host we did not build. The mgmt OVS bridge is just as good a
+  # source of truth - without this fallback the per-route check silently no-ops.
+  if [[ -z "$mgmt_expected" ]]; then
+    if ip -o -4 addr show dev mgmt 2>/dev/null | grep -q 'inet '; then
+      mgmt_expected="mgmt"
+      note "no profile - treating the 'mgmt' bridge as the management path"
+    fi
   fi
   local rif
   while read -r rif; do
@@ -2135,7 +2203,14 @@ doctor() {
     if arping -D -q -c 2 -I "$mif" "$mip" >/dev/null 2>&1; then
       d_ok "no duplicate address for ${mip}"
     else
-      d_bad "DUPLICATE IP detected for ${mip} on ${mif} - another host claims it"
+      d_bad "arping -D says something else answers for ${mip} on ${mif}"
+      note "     This is NOT proof of another host. With arp_ignore=0 a multi-homed"
+      note "     host answers for its own address out a different NIC in the same"
+      note "     broadcast domain and trips this same check."
+      note "     Confirm before acting: run 'arping -D -I <nic> ${mip}' from a"
+      note "     DIFFERENT host, and compare the replying MAC against this host's"
+      note "     own NICs (ip -br link). Same MAC = self-answer, fix with F04."
+      note "     Different MAC = a real address conflict, fix the other host."
     fi
   fi
 
@@ -2270,9 +2345,15 @@ doctor() {
     if [[ -n "$free" ]]; then
       note "     Unassigned NICs available for a dedicated compute uplink:${free}"
     else
-      note "     No spare NICs. This host must run CONVERGED: management moves to a"
-      note "     tagged VLAN on the existing bond, and the untagged bond becomes the"
-      note "     compute trunk. See --doctor output above for what currently owns it."
+      note "     No UNUSED NICs - which is expected on a four-NIC host."
+      note "     HPE's four-NIC reference design (Network Considerations, 'Four NICs"
+      note "     with LACP/XOR bonds and MPIO for storage traffic') converges mgmt and"
+      note "     compute onto one bonded trunk, with the other two NICs on storage"
+      note "     MPIO. Management rides a tagged VLAN on that bond; the untagged bond"
+      note "     becomes the compute trunk. This host is already cabled that way."
+      note "     Run --reconfigure and accept the converged option; let VME host prep"
+      note "     create cmpt from the cluster wizard rather than building it by hand."
+      note "     Splitting the bond instead would cost link redundancy on both paths."
     fi
   fi
 
@@ -2349,6 +2430,28 @@ doctor() {
     d_ok "rp_filter=${rp}"
   fi
 
+  # rp_filter says nothing about ARP behaviour. A host with several NICs in one
+  # broadcast domain will answer ARP for ANY local address out ANY interface
+  # unless arp_ignore is raised - which looks exactly like a duplicate IP.
+  local ai aa
+  ai="$(sysctl -n net.ipv4.conf.all.arp_ignore 2>/dev/null || echo '?')"
+  aa="$(sysctl -n net.ipv4.conf.all.arp_announce 2>/dev/null || echo '?')"
+  if [[ "$ai" == "0" || "$aa" == "0" ]]; then
+    local naddr; naddr="$( { ip -o -4 addr show 2>/dev/null || true; } | awk '$2!="lo"' | wc -l )"
+    if [[ "$naddr" -gt 2 ]]; then
+      d_warn "arp_ignore=${ai} arp_announce=${aa} on a host with ${naddr} addressed interfaces"
+      note "     Linux will answer ARP for any local address on any interface. If two"
+      note "     of those interfaces share a broadcast domain, the host answers for"
+      note "     its own address out the wrong NIC - which reads as a duplicate IP"
+      note "     and can silently collapse MPIO onto one path."
+      d_fix F04 "arp_ignore=1, arp_announce=2 (and rp_filter=2)"
+    else
+      d_ok "arp_ignore=${ai} arp_announce=${aa} (few enough interfaces to be safe)"
+    fi
+  else
+    d_ok "arp_ignore=${ai} arp_announce=${aa}"
+  fi
+
   if [[ -f "$WAITONLINE_DROPIN" ]]; then
     d_ok "wait-online drop-in present"
   else
@@ -2391,6 +2494,65 @@ doctor() {
     ok "nothing to repair"
   fi
   [[ "$D_FAIL" -gt 0 ]] && return 1 || return 0
+}
+
+doctor_switch_side() {
+  hdr "switch side (from LLDP)"
+  if ! command -v lldpctl >/dev/null 2>&1; then
+    d_warn "lldpd not installed - cannot see what these NICs are plugged into"
+    note "     apt install lldpd    then re-run. This is the single most useful"
+    note "     thing you can add before choosing a bond mode: it tells you whether"
+    note "     the two bond members land on ONE switch or TWO."
+    return 0
+  fi
+
+  local b bonds=() slave chassis port vlans
+  for b in "${PROC_BONDING}"/*; do [[ -e "$b" ]] && bonds+=("$(basename "$b")"); done
+  [[ ${#bonds[@]} -eq 0 ]] && { d_warn "no bonds to inspect"; return 0; }
+
+  for b in "${bonds[@]}"; do
+    local mode; mode="$(awk -F': ' '/^Bonding Mode/{print $2; exit}' "${PROC_BONDING}/${b}")"
+    info "${b} (${mode})"
+    local -a seen=()
+    for slave in $(awk -F': ' '/^Slave Interface:/{print $2}' "${PROC_BONDING}/${b}"); do
+      chassis="$(lldpctl -f keyvalue "$slave" 2>/dev/null | awk -F= '/\.chassis\.name=/{print $2; exit}')"
+      port="$(lldpctl -f keyvalue "$slave" 2>/dev/null | awk -F= '/\.port\.(descr|ifname)=/{print $2; exit}')"
+      vlans="$(lldpctl -f keyvalue "$slave" 2>/dev/null | awk -F= '/\.vlan\.vlan-id=/{print $2}' | paste -sd, -)"
+      if [[ -z "${chassis:-}" ]]; then
+        d_warn "  ${slave}: no LLDP neighbour (switch not sending LLDP, or link down)"
+      else
+        info "  ${slave} -> ${chassis} ${port:+port ${port}}${vlans:+  vlans seen: ${vlans}}"
+        seen+=("$chassis")
+      fi
+    done
+
+    # one switch or two? this is what decides whether LACP is even possible
+    local uniq; uniq="$(printf '%s\n' "${seen[@]:-}" | grep -v '^$' | sort -u | wc -l)"
+    if [[ "$uniq" -ge 2 ]]; then
+      d_warn "  ${b} spans ${uniq} switches."
+      note "       LACP across two chassis needs MLAG / stacking / VSF / IRF / vPC."
+      note "       Plain balance-xor across two INDEPENDENT switches means the same"
+      note "       source MAC appears on ports of both - the switches will log MAC"
+      note "       moves, and some will err-disable the port on a mac-move threshold."
+      note "       If the pair is not stacked, active-backup is the only mode that is"
+      note "       unambiguously safe; it costs you half the aggregate bandwidth."
+    elif [[ "$uniq" -eq 1 ]]; then
+      ok "  ${b} lands on a single switch (${seen[0]})"
+      note "       A static port-channel or LACP LAG on those ports is straightforward."
+    fi
+
+    case "$mode" in
+      *802.3ad*)
+        note "       LACP: the peer ports MUST be in a LAG. Check the partner MAC above." ;;
+      *"load balancing (xor)"*|*balance-xor*)
+        note "       XOR: transmits across all members from one MAC. The peer ports need"
+        note "       to be a static aggregation, or you get MAC flapping. XOR does NOT"
+        note "       negotiate, so a mismatch is silent - no partner state to inspect." ;;
+      *active-backup*)
+        note "       active-backup: needs NO switch aggregation. One link carries traffic."
+        note "       Safe anywhere, including across unstacked switches. Half the bandwidth." ;;
+    esac
+  done
 }
 
 check_bond_health_doctor() {
