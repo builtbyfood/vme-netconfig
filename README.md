@@ -1,4 +1,4 @@
-# vme-netconfig v2.11.0
+# vme-netconfig v2.13.0
 
 Network configurator, auditor, and repair tool for **HPE Morpheus VM Essentials /
 HVM 9.0.1+** hosts on Ubuntu 22.04 / 24.04.
@@ -89,6 +89,12 @@ this is for fixing a host in place.
 Read-only. Bonds, LACP aggregation, MTU, routing, OVS bridge health, L3
 ownership, iSCSI/multipath, sysctls, dark links, netplan hygiene. Reports
 pass/warn/fail and lists repairable items by ID.
+
+With `lldpd` installed it also reports the **switch side**: the neighbour chassis,
+port, and advertised VLANs for each bond member, and whether the bond lands on one
+switch or two. That fact decides whether LACP is possible at all — across two
+independent chassis it is not, and `balance-xor` there puts one source MAC on ports
+of both, which switches log as MAC moves and some punish with err-disable.
 
 It also flags a host with a `mgmt` bridge but no `cmpt` — host prep that built
 the management path and stopped — and tells you whether there are spare NICs for
@@ -487,8 +493,8 @@ Ubuntu 22.04 or 24.04 (24.04 preferred for 9.0.1+ cluster layouts), `netplan`,
 `iproute2`, and `python3-yaml` for the bridge/L3 analysis and `--reconfigure`.
 Without pyyaml those checks are skipped with a notice rather than guessed.
 
-Recommended: `ethtool`, `lldpd`, `iputils-arping`, `open-iscsi`,
-`multipath-tools`.
+Recommended: `ethtool`, **`lldpd`** (required for the switch-side report),
+`iputils-arping`, `open-iscsi`, `multipath-tools`.
 
 ## Known gaps
 

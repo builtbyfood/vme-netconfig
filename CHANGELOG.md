@@ -3,6 +3,26 @@
 All notable changes to `vme-netconfig`. Versions follow semver loosely; the
 minor number bumps whenever behaviour changes.
 
+## [2.13.0] — Maintenance Mode does not unmount GFS2
+
+**Fixed**
+- The Maintenance Mode poller waited for the GFS2 mount to clear. It does not
+  clear: a parked host stays a member of the storage cluster with the LUN
+  mounted, so the wait never ended. Observed on hpevmess03 (VME 9.0). The poller
+  now watches guest count via `virsh` only, which is the signal that actually
+  moves.
+- A mounted GFS2 filesystem no longer aborts `--reconfigure`. It is the normal
+  state of a parked host, and blocking on it made the mode unusable on exactly
+  the hosts it was written for.
+
+**Added**
+- Storage path analysis after NIC selection. Traces each live iSCSI session to
+  the interface carrying it and compares that against the interfaces about to be
+  rebuilt. Overlap is a hard refusal; no overlap is reported as such.
+- Typed `MAINTENANCE` confirmation when GFS2 is mounted, with an explicit note
+  that whether VME's GFS2 cluster/lock traffic rides the management network on
+  9.0+ is unknown to this tool.
+
 ## [2.12.0] — switch-side visibility
 
 **Added**

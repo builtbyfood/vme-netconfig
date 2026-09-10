@@ -31,7 +31,7 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-VERSION="2.12.0"
+VERSION="2.13.0"
 PROG="${0##*/}"
 
 # ---------------------------------------------------------------------------
@@ -1555,30 +1555,100 @@ PYEOF
 }
 
 rc_readiness() {
-  # echoes "clear" or a description of what is still holding the host
-  local why=""
-  { mount 2>/dev/null || true; } | grep -q 'type gfs2' && why="GFS2 still mounted"
+  # Only guest evacuation is pollable. Maintenance Mode does NOT unmount GFS2 -
+  # the host stays a member of the storage cluster with the LUN mounted, so
+  # waiting for that unmount waits forever. Observed on hpevmess03 (VME 9.0).
   local vms=""
   command -v virsh >/dev/null 2>&1 && vms="$( { virsh list --name 2>/dev/null || true; } | grep -c . || true )"
   if [[ -n "${vms:-}" && "${vms:-0}" -gt 0 ]]; then
-    why="${why}${why:+; }${vms} guests still running"
+    printf '%s guests still running' "$vms"
+  else
+    printf 'clear'
   fi
-  printf '%s' "${why:-clear}"
+}
+
+rc_storage_path() {
+  # Which interfaces actually carry the iSCSI sessions? One per line.
+  command -v iscsiadm >/dev/null 2>&1 || return 0
+  local portal dev
+  for portal in $( { iscsiadm -m session 2>/dev/null || true; } \
+                   | awk '{print $3}' | cut -d, -f1 | sed 's/:[0-9]*$//' | sort -u ); do
+    [[ -n "$portal" ]] || continue
+    dev="$(ip -o route get "$portal" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1)"
+    if [[ -n "${dev:-}" ]]; then printf '%s\n' "$dev"; fi
+  done | sort -u
+  return 0
+}
+
+rc_storage_path_check() {
+  # Runs after NIC selection: does the rebuild touch the LIVE storage path?
+  hdr "Storage path impact"
+  local mounted="no"
+  { mount 2>/dev/null || true; } | grep -q 'type gfs2' && mounted="yes"
+  if [[ "$mounted" == "no" ]]; then
+    ok "no GFS2 mount - nothing to protect"
+    return 0
+  fi
+
+  local -a rebuild=()
+  local x
+  for x in $MGMT_MEMBERS $COMPUTE_MEMBERS "$MGMT_BOND" "$COMPUTE_BOND"; do
+    [[ -n "$x" ]] && rebuild+=("$x")
+  done
+  [[ "$MGMT_VLAN" != "0" ]] && rebuild+=("${MGMT_BOND}.${MGMT_VLAN}")
+
+  local spath; spath="$(rc_storage_path)"
+  if [[ -z "$spath" ]]; then
+    warn "GFS2 is mounted but no iSCSI session could be traced to an interface."
+    warn "Cannot prove the storage path is clear of the rebuild. Treat as risky."
+  else
+    info "iSCSI sessions currently ride: $(printf '%s' "$spath" | tr '\n' ' ')"
+    local hit="" d r
+    for d in $spath; do
+      for r in "${rebuild[@]}"; do
+        if [[ "$d" == "$r" ]] && [[ " ${hit} " != *" ${d} "* ]]; then hit="${hit} ${d}"; fi
+      done
+    done
+    if [[ -n "$hit" ]]; then
+      bad "The rebuild touches the LIVE storage path:${hit}"
+      bad "This will cut iSCSI under a mounted GFS2 filesystem."
+      die "refusing - relocate storage or unmount the datastore first"
+    fi
+    ok "storage path is NOT among the interfaces being rebuilt"
+  fi
+
+  printf '\n'
+  warn "GFS2 stays mounted in Maintenance Mode. That is expected, not a fault."
+  warn "What this rebuild interrupts is management and compute connectivity."
+  note "     Whether VME's GFS2 cluster/lock traffic rides the management network"
+  note "     on 9.0+ is NOT something this tool can determine. If it does, bouncing"
+  note "     the bond may make the cluster consider this host absent even though"
+  note "     its storage path stays intact."
+  note "     Have the iLO console open before you continue."
+  printf '\n'
+  if [[ "$ASSUME_YES" == "yes" ]]; then
+    warn "--yes given: proceeding without typed confirmation"
+    return 0
+  fi
+  local a; a="$(ask 'Type MAINTENANCE to confirm the host is parked and proceed' '')"
+  [[ "$a" == "MAINTENANCE" ]] || die "not confirmed - cancelled"
+  ok "confirmed"
+  return 0
 }
 
 rc_wait_for_maintenance() {
-  # Maintenance Mode evacuates the guests and drops the host out of the storage
-  # cluster, which unmounts GFS2. So "GFS2 gone and no guests" IS the green light -
-  # poll for it rather than making the operator guess when it has settled.
+  # Poll for guest evacuation only. GFS2 stays mounted throughout Maintenance
+  # Mode, so it is not a settling signal.
   local timeout="${1:-900}" interval=10 elapsed=0 why last=""
-  hdr "Waiting for Maintenance Mode to settle"
+  hdr "Waiting for guests to evacuate"
   info "In VME Manager: cluster detail page -> this host -> Maintenance Mode."
-  info "Watching for guests to evacuate and the GFS2 mount to clear."
+  info "Watching virsh for running guests to reach zero."
+  note "The GFS2 mount stays put - that is expected and is not waited on."
   note "Ctrl-C to abort. Timeout ${timeout}s."
   while [[ "$elapsed" -lt "$timeout" ]]; do
     why="$(rc_readiness)"
     if [[ "$why" == "clear" ]]; then
-      printf '\n'; ok "host is parked: no GFS2 mount, no running guests (${elapsed}s)"
+      printf '\n'; ok "guests evacuated (${elapsed}s)"
       return 0
     fi
     if [[ "$why" != "$last" ]]; then
@@ -1590,7 +1660,7 @@ rc_wait_for_maintenance() {
     sleep "$interval"; elapsed=$((elapsed+interval))
   done
   printf '\n'
-  bad "still not parked after ${timeout}s: $(rc_readiness)"
+  bad "guests still present after ${timeout}s: $(rc_readiness)"
   return 1
 }
 
@@ -1600,11 +1670,9 @@ rc_cluster_guard() {
   local blocked="no"
 
   if { mount 2>/dev/null || true; } | grep -q 'type gfs2'; then
-    bad "GFS2 is mounted on this host."
-    note "     Rebuilding the uplinks under a live GFS2 mount cuts the storage path"
-    note "     and the cluster lock traffic mid-write. Expect the mount to hang, the"
-    note "     cluster to mark this host down, and VME HA to act on that."
-    blocked="yes"
+    info "GFS2 is mounted. Maintenance Mode does not unmount it - the host stays a"
+    info "member of the storage cluster. That is normal and is not a blocker here;"
+    info "the storage path is analysed against your NIC selection later on."
   fi
 
   # Morpheus VME 9.0+ manages GFS2 consistency itself through heartbeat datastores
@@ -1625,8 +1693,9 @@ rc_cluster_guard() {
   if [[ "$blocked" == "yes" ]]; then
     printf '\n'
     if [[ "$ASSUME_YES" != "yes" && "$FORCE" != "yes" ]]; then
-      info "Maintenance Mode migrates the guests off and drops this host out of the"
-      info "storage cluster, which unmounts GFS2. That unmount is the green light."
+      info "Maintenance Mode migrates the guests off this host. It does NOT unmount"
+      info "GFS2 - the host stays in the storage cluster. Guest count reaching zero"
+      info "is the signal, so that is what gets polled."
       if [[ "$(ask_yn 'Set Maintenance Mode now and have me wait for it?' 'y')" == "y" ]]; then
         if rc_wait_for_maintenance "${MAINT_TIMEOUT:-900}"; then
           blocked="no"; WAS_PARKED="yes"
@@ -1639,20 +1708,17 @@ rc_cluster_guard() {
 
   if [[ "$blocked" == "yes" ]]; then
     printf '\n'
-    warn "Park the host in VME Manager before running this:"
+    warn "Evacuate this host before running this:"
     note "  Cluster detail page -> the host -> Maintenance Mode"
-    note "  That evacuates workloads and stops the cluster relying on this node."
-    note "  Confirm no guests remain here, then re-run."
-    note "  If a heartbeat datastore rides the interfaces you are about to rebuild,"
-    note "  expect the cluster to mark this host down while the links bounce."
+    note "  Wait for running guests to reach zero (virsh list), then re-run."
     printf '\n'
     if [[ "$FORCE" == "yes" ]]; then
       warn "--force given: proceeding anyway. This is your fencing event."
     else
-      die "refusing to rebuild uplinks on a live clustered host (--force to override)"
+      die "refusing to rebuild uplinks while guests are running here (--force to override)"
     fi
   else
-    ok "no GFS2 mount and no running guests on this host"
+    ok "no running guests on this host"
   fi
 }
 
@@ -1802,6 +1868,8 @@ reconfigure() {
     warn "The switch ports for ${COMPUTE_MEMBERS} must trunk those VLANs."
   fi
   COMPUTE_VLANS="$(ask 'Compute VLAN ids/range (recorded for the cluster wizard)' '')"
+
+  rc_storage_path_check
 
   # --- review ----------------------------------------------------------
   hdr "Review"
